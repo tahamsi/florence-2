@@ -3,18 +3,12 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoProcessor,
-    PreTrainedModel,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, PreTrainedModel, Trainer, TrainingArguments
 
 DEFAULT_MODEL_ID = "microsoft/Florence-2-base"
 DEFAULT_CAPTION_PROMPT = "<CAPTION>"
@@ -26,6 +20,32 @@ DEFAULT_IGNORE_PROMPT_TOKENS = 1
 _device: torch.device
 _dtype: torch.dtype
 _cache_dir: Path | None = None
+
+
+if not hasattr(PreTrainedModel, "_supports_sdpa"):
+    PreTrainedModel._supports_sdpa = False
+
+
+def _from_pretrained_with_dtype(
+    loader: type[PreTrainedModel],
+    model_source: str | Path,
+    *,
+    dtype: torch.dtype,
+    **kwargs,
+) -> PreTrainedModel:
+    call_kwargs = dict(kwargs)
+    call_kwargs.setdefault("trust_remote_code", True)
+    call_kwargs.setdefault("cache_dir", str(_cache_dir) if _cache_dir else None)
+    call_kwargs["dtype"] = dtype
+    identifier = str(model_source)
+    try:
+        return loader.from_pretrained(identifier, **call_kwargs)
+    except TypeError as exc:
+        if "dtype" not in str(exc).lower():
+            raise
+        call_kwargs.pop("dtype", None)
+        call_kwargs["torch_dtype"] = dtype
+        return loader.from_pretrained(identifier, **call_kwargs)
 
 
 def _set_device(device: torch.device) -> None:
@@ -122,19 +142,43 @@ def _load_processor(model_source: str) -> AutoProcessor:
         return AutoProcessor.from_pretrained(model_source, **kwargs)
 
 
-def _load_model(model_source: str, *, dtype: torch.dtype) -> PreTrainedModel:
-    _ensure_extra_dependencies()
+def _load_config(model_source: str) -> Any:
     source_path = Path(model_source).expanduser()
     kwargs = {
         "trust_remote_code": True,
-        "torch_dtype": dtype,
         "cache_dir": str(_cache_dir) if _cache_dir else None,
     }
     if source_path.exists():
-        model = AutoModelForCausalLM.from_pretrained(str(source_path), **kwargs)
+        return AutoConfig.from_pretrained(str(source_path), **kwargs)
+
+    try:
+        return AutoConfig.from_pretrained(model_source, local_files_only=True, **kwargs)
+    except OSError as exc:
+        if _is_offline():
+            raise RuntimeError(
+                f"Florence-2 config for '{model_source}' is not available locally. "
+                "Download it with internet access or point to a local snapshot."
+            ) from exc
+        print(f"Local config for '{model_source}' not found; attempting download...", flush=True)
+        return AutoConfig.from_pretrained(model_source, **kwargs)
+
+
+def _load_model(model_source: str, *, dtype: torch.dtype) -> PreTrainedModel:
+    _ensure_extra_dependencies()
+    config = _load_config(model_source)
+    source_path = Path(model_source).expanduser()
+    load_kwargs = {}
+    if source_path.exists():
+        model = _from_pretrained_with_dtype(AutoModelForCausalLM, str(source_path), dtype=dtype, **load_kwargs)
     else:
         try:
-            model = AutoModelForCausalLM.from_pretrained(model_source, local_files_only=True, **kwargs)
+            model = _from_pretrained_with_dtype(
+                AutoModelForCausalLM,
+                model_source,
+                dtype=dtype,
+                local_files_only=True,
+                **load_kwargs,
+            )
         except OSError as exc:
             if _is_offline():
                 raise RuntimeError(
@@ -142,10 +186,14 @@ def _load_model(model_source: str, *, dtype: torch.dtype) -> PreTrainedModel:
                     "Download them with internet access or point to a local snapshot."
                 ) from exc
             print(f"Local model weights for '{model_source}' not found; attempting download...", flush=True)
-            model = AutoModelForCausalLM.from_pretrained(model_source, **kwargs)
+            model = _from_pretrained_with_dtype(AutoModelForCausalLM, model_source, dtype=dtype, **load_kwargs)
 
     if not hasattr(model, "_supports_sdpa"):
         setattr(model, "_supports_sdpa", False)
+    model.config = config  # ensure patched config is attached, including attention implementation
+    if not getattr(model.config, "_attn_implementation", None):
+        setattr(model.config, "_attn_implementation", "eager")
+    setattr(model.config, "_attn_implementation_internal", getattr(model.config, "_attn_implementation", "eager"))
     return model
 
 
